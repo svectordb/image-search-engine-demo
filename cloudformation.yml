@@ -1,0 +1,181 @@
+Parameters:
+  IntegrationId:
+    Type: String
+    Description: SvectorDB integration id
+  DatabaseId:
+    Type: String
+    Description: SvectorDB database id
+  LambdaBucket:
+    Type: String
+    Description: S3 bucket for the lambda code
+  LambdaKey:
+    Type: String
+    Description: S3 key for the lambda code
+  UseCustomDomain:
+    Type: String
+    Description: Use a custom domain for the CloudFront distribution
+    Default: false
+    AllowedValues:
+      - true
+      - false
+  CustomDomain:
+    Type: String
+    Description: Custom domain for the CloudFront distribution
+  CertificateArn:
+    Type: String
+    Description: Certificate ARN for the custom domain
+  HostedZoneId:
+    Type: String
+    Description: Hosted zone id for the custom domain
+Conditions:
+  UseCustomDomain: !Equals [!Ref UseCustomDomain, 'true']
+Resources:
+  ApiKey:
+    Type: SvectorDB::VectorDatabase::ApiKey
+    Properties:
+      IntegrationId: !Ref IntegrationId
+      DatabaseId: !Ref DatabaseId
+  SearchLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt SearchLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Ref LambdaKey
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          DATABASE_ID: !Ref DatabaseId
+          API_KEY: !Ref ApiKey
+      Timeout: 30
+  SearchLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  SearchLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      Cors: 
+        AllowMethods: 
+          - GET
+        AllowOrigins: 
+          - '*'
+      TargetFunctionArn: !GetAtt SearchLambda.Arn
+  SearchLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt SearchLambda.Arn
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+  CloudFrontOriginBucket:
+    Type: AWS::S3::Bucket
+  CloudFrontOriginBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudFrontOriginBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginBucketOAI}'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${CloudFrontOriginBucket}/*'
+  CloudFrontOriginBucketOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${CloudFrontOriginBucket}'
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If [UseCustomDomain, [!Ref CustomDomain], []]
+        Origins:
+          - DomainName: !Select [2, !Split ["/", !GetAtt SearchLambdaUrl.FunctionUrl]]
+            Id: SearchLambda
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+          - DomainName: !GetAtt CloudFrontOriginBucket.RegionalDomainName
+            Id: !Ref CloudFrontOriginBucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginBucketOAI}'
+        Enabled: true
+        DefaultRootObject: index.html
+        CacheBehaviors:
+          - PathPattern: /search
+            TargetOriginId: SearchLambda
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            ForwardedValues:
+              QueryString: true
+              QueryStringCacheKeys:
+                - searchQuery
+            MinTTL: 0
+            DefaultTTL: 86400
+            MaxTTL: 86400
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          TargetOriginId: !Ref CloudFrontOriginBucket
+          ForwardedValues:
+            QueryString: false
+          ViewerProtocolPolicy: redirect-to-https
+        Logging:
+          IncludeCookies: false
+          Bucket: !GetAtt CloudFrontLogsBucket.RegionalDomainName
+          Prefix: cloudfront/
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn: !If [UseCustomDomain, !Ref CertificateArn, !Ref AWS::NoValue ]
+          CloudFrontDefaultCertificate: !If [UseCustomDomain, !Ref AWS::NoValue, true ]
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: !If [UseCustomDomain, 'sni-only', !Ref AWS::NoValue ]
+  CloudFrontDNSRecordA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+  CloudFrontDNSRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: UseCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomain
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
